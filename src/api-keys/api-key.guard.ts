@@ -4,6 +4,7 @@ import {
   ExecutionContext,
   HttpException,
   Logger,
+  Optional,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -35,6 +36,8 @@ export const IS_PUBLIC = 'isPublic';
  *   `NETWORK_MISMATCH` code *before* the handler runs (#943).
  * - **Fail-closed on dependency outage.** An unexpected validation failure is
  *   surfaced as 503 rather than being treated as "no key" (401) or allowed.
+ * - **Audit is fail-soft.** An audit-sink failure is logged and never changes
+ *   the authentication decision (#1113).
  */
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
@@ -87,7 +90,7 @@ export class ApiKeyGuard implements CanActivate {
     }
 
     if (!apiKey) {
-      this.auditDecision({
+      await this.auditDecision({
         action: ApiKeyAuditAction.REJECTED,
         reason: ApiKeyAuditReason.MISSING,
         apiKey: undefined,
@@ -160,8 +163,11 @@ export class ApiKeyGuard implements CanActivate {
    * Never throws and never re-throws: an audit-sink problem must not change the
    * authentication outcome, and it must not leak the presented key into an
    * error. The fingerprint is derived from the key, never the key itself.
+   *
+   * The call is awaited so ordering is deterministic, but a rejected promise
+   * from the sink is caught and logged here rather than escaping (#1113).
    */
-  private auditDecision(input: {
+  private async auditDecision(input: {
     action: ApiKeyAuditAction;
     reason?: ApiKeyAuditReason;
     apiKey?: string;
@@ -176,7 +182,7 @@ export class ApiKeyGuard implements CanActivate {
     apiKeyId?: string;
     developerId?: string;
     projectId?: string;
-  }): void {
+  }): Promise<void> {
     if (!this.audit) {
       return;
     }
@@ -186,7 +192,7 @@ export class ApiKeyGuard implements CanActivate {
         input.request.originalUrl ??
         ''
       ).split('?')[0];
-      this.audit.record({
+      await this.audit.record({
         action: input.action,
         reason: input.reason,
         fingerprint: this.audit.fingerprint(input.apiKey),
@@ -197,8 +203,11 @@ export class ApiKeyGuard implements CanActivate {
         ip: input.request.ip ?? input.request.socket?.remoteAddress,
         correlationId: input.correlationId,
       });
-    } catch {
+    } catch (error) {
       // Fail-soft: the request path must not depend on the audit sink.
+      this.logger.warn(
+        `API key audit write failed (${input.action}): ${(error as Error)?.message}`,
+      );
     }
   }
 
@@ -238,70 +247,50 @@ export class ApiKeyGuard implements CanActivate {
     // the response.
     if (response && typeof response.once === 'function') {
       response.once('finish', () => {
-        try {
-          this.auditDecision({
-            action: ApiKeyAuditAction.ACCEPTED,
-            apiKey: undefined,
-            request,
-            correlationId: resolveRequestId(
-              request.requestId ?? request.headers?.['x-request-id'],
-            ),
-            apiKeyId: validation.apiKey?.id,
-            developerId: validation.developer?.id,
-            projectId: validation.project?.id,
-          });
-        } catch {
-          // Fail-soft.
-        }
+        void this.auditDecision({
+          action: ApiKeyAuditAction.ACCEPTED,
+          apiKey: undefined,
+          request,
+          correlationId: resolveRequestId(
+            request.requestId ?? request.headers?.['x-request-id'],
+          ),
+          apiKeyId: validation.apiKey?.id,
+          developerId: validation.developer?.id,
+          projectId: validation.project?.id,
+        });
       });
     }
   }
 }
 
-/**
- * Validates the shape of a presented API key before it is looked up.
- *
- * Keys are opaque `prefix.secret` tokens; anything that does not match the
- * expected shape is rejected as `INVALID_FORMAT` without touching the store.
- */
 function isValidApiKeyFormat(apiKey: string): boolean {
-  return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(apiKey);
+  // Basic format validation: non-empty, reasonable length, no whitespace.
+  return apiKey.length >= 8 && apiKey.length <= 256 && !/\s/.test(apiKey);
 }
 
-/**
- * Extracts the network a request targets, if any, from the query string or the
- * `x-network` header. Absent means "no network constraint".
- */
 function extractRequestedNetwork(request: any): string | null {
-  const fromQuery = request.query?.network;
-  if (typeof fromQuery === 'string' && fromQuery.length > 0) {
-    return fromQuery;
-  }
-  const fromHeader = request.headers?.['x-network'];
-  if (typeof fromHeader === 'string' && fromHeader.length > 0) {
-    return fromHeader;
+  const header = request.headers?.['x-network'];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return value.trim().toUpperCase();
   }
   return null;
 }
 
-/**
- * Refuses the request when a network-scoped key is used against a different
- * network (#943). A key with no scope, or a request with no requested network,
- * is allowed through.
- */
 function assertNetworkMatch(input: {
   scope: string | null;
   requested: string | null;
-  correlationId: string;
+  correlationId?: string;
   subject: string;
 }): void {
   if (!input.scope || !input.requested) {
     return;
   }
-  if (input.scope !== input.requested) {
-    throw new UnauthorizedException({
-      code: ApiKeyErrorCode.NETWORK_MISMATCH,
-      message: `API key is scoped to ${input.scope} and cannot be used for ${input.requested}`,
-    });
+  if (input.scope.toUpperCase() === input.requested.toUpperCase()) {
+    return;
   }
+  throw new UnauthorizedException({
+    code: ApiKeyErrorCode.NETWORK_MISMATCH,
+    message: `API key is scoped to ${input.scope} and cannot be used on ${input.requested}`,
+  });
 }

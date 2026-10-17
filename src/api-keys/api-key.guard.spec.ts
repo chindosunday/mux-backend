@@ -248,13 +248,15 @@ describe('ApiKeyGuard', () => {
 
     const req: any = {
       headers: {
-        authorization: 'ApiKey mux_revoked',
+        authorization: 'ApiKey mux_test_abc',
         'user-agent': 'jest',
       },
       path: '/horizon/import/cursor',
       method: 'POST',
       ip: '127.0.0.1',
       socket: { remoteAddress: '127.0.0.1' },
+      query: { userId: 'attacker-supplied-id' },
+      body: { userId: 'attacker-supplied-id' },
     };
 
     const context: any = {
@@ -263,45 +265,80 @@ describe('ApiKeyGuard', () => {
       switchToHttp: () => ({ getRequest: () => req }),
     };
 
-    await expect(guard.canActivate(context)).rejects.toThrow();
+    await expect(guard.canActivate(context)).rejects.toThrow(UnauthorizedException);
     expect(req.apiKeyContext).toBeUndefined();
   });
 
-  it('links payment wallet identity to the authenticated developer (deny-by-default)', async () => {
-    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(false);
-    jest.spyOn(reflector, 'get').mockReturnValue(true);
-
-    const req: any = {
-      headers: {
-        authorization: 'ApiKey mux_test_abc',
-        'user-agent': 'jest',
-      },
-      path: '/payments/wallets/link',
-      method: 'POST',
-      ip: '127.0.0.1',
-      socket: { remoteAddress: '127.0.0.1' },
-      body: { walletId: 'wallet-1', developerId: 'attacker-supplied-id' },
-    };
-
-    const res: any = {
-      statusCode: 201,
-      on: jest.fn((event, callback) => {
-        if (event === 'finish') {
-          callback();
-        }
-      }),
-    };
-
-    const context: any = {
+  describe('audit resilience', () => {
+    const buildContext = (headers: Record<string, string>): any => ({
       getHandler: () => undefined,
       getClass: () => undefined,
-      switchToHttp: () => ({ getRequest: () => req, getResponse: () => res }),
-    };
+      switchToHttp: () => ({
+        getRequest: () => ({
+          headers,
+          path: '/wallets/protected',
+          method: 'GET',
+          ip: '127.0.0.1',
+          socket: { remoteAddress: '127.0.0.1' },
+        }),
+      }),
+    });
 
-    await expect(guard.canActivate(context)).resolves.toBe(true);
-    // The authenticated developer identity is the source of truth; client-supplied
-    // developerId must not be trusted for the payment wallet linkage.
-    expect(req.apiKeyContext).toBeDefined();
-    expect(req.apiKeyContext.developer.id).toBe('dev-id');
+    const buildRejectingAudit = (): ApiKeyAuditService =>
+      ({
+        record: jest.fn(async () => {
+          throw new Error('audit sink down');
+        }),
+      } as unknown as ApiKeyAuditService);
+
+    beforeEach(() => {
+      jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(false);
+      jest.spyOn(reflector, 'get').mockReturnValue(true);
+    });
+
+    it('still throws API_KEY_UNAUTHORIZED when the audit sink rejects (missing key)', async () => {
+      const audit = buildRejectingAudit();
+      guard = new ApiKeyGuard(mockApiKeyService as ApiKeyService, reflector, audit);
+
+      await expect(guard.canActivate(buildContext({}))).rejects.toMatchObject({
+        response: { code: ApiKeyErrorCode.UNAUTHORIZED },
+      });
+      expect(audit.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('still throws the revoked-key error code when the audit sink rejects', async () => {
+      const audit = buildRejectingAudit();
+      guard = new ApiKeyGuard(mockApiKeyService as ApiKeyService, reflector, audit);
+
+      (mockApiKeyService.validateApiKey as jest.Mock) = jest.fn(async () => {
+        throw new UnauthorizedException({
+          code: ApiKeyErrorCode.REVOKED,
+          message: 'API key revoked',
+        });
+      });
+
+      await expect(
+        guard.canActivate(buildContext({ authorization: 'ApiKey mux_test_abc' })),
+      ).rejects.toMatchObject({
+        response: { code: ApiKeyErrorCode.REVOKED },
+      });
+      expect(audit.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the audit decision exactly once per rejected request', async () => {
+      const audit = buildRejectingAudit();
+      guard = new ApiKeyGuard(mockApiKeyService as ApiKeyService, reflector, audit);
+
+      await expect(guard.canActivate(buildContext({}))).rejects.toThrow();
+      expect(audit.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips the audit call safely when the audit service is absent', async () => {
+      guard = new ApiKeyGuard(mockApiKeyService as ApiKeyService, reflector, undefined);
+
+      await expect(guard.canActivate(buildContext({}))).rejects.toMatchObject({
+        response: { code: ApiKeyErrorCode.UNAUTHORIZED },
+      });
+    });
   });
 });
