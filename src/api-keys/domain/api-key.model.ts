@@ -121,6 +121,13 @@ export const ApiKeyErrorCode = {
    * developer's project ids.
    */
   PROJECT_NOT_FOUND: 'API_KEY_PROJECT_NOT_FOUND',
+
+  /**
+   * The requested status change is not permitted by the lifecycle table
+   * (#1111). `REVOKED` and `EXPIRED` are terminal, so e.g. a reactivation
+   * attempt is refused with this stable code.
+   */
+  INVALID_STATUS_TRANSITION: 'API_KEY_INVALID_STATUS_TRANSITION',
 } as const;
 
 export type ApiKeyErrorCode =
@@ -154,4 +161,39 @@ export function canTransitionApiKeyStatus(
   to: ApiKeyStatus,
 ): boolean {
   return ALLOWED_TRANSITIONS[from].has(to);
+}
+
+/**
+ * Typed error raised when a status write is refused by the lifecycle table.
+ *
+ * Carries a stable `errorCode` so callers can branch on it without parsing
+ * prose, and records the attempted transition for diagnostics.
+ */
+export class ApiKeyStatusTransitionError extends Error {
+  readonly errorCode: ApiKeyErrorCode =
+    ApiKeyErrorCode.INVALID_STATUS_TRANSITION;
+
+  constructor(
+    readonly from: ApiKeyStatus,
+    readonly to: ApiKeyStatus,
+  ) {
+    super(`API key status transition ${from} -> ${to} is not allowed`);
+    this.name = 'ApiKeyStatusTransitionError';
+  }
+}
+
+/**
+ * Enforces the lifecycle table on a status write (#1111).
+ *
+ * Throws `ApiKeyStatusTransitionError` when `from -> to` is not permitted, so
+ * `REVOKED` and `EXPIRED` are genuinely terminal rather than a comment. Call
+ * this before persisting any status change.
+ */
+export function assertApiKeyStatusTransition(
+  from: ApiKeyStatus,
+  to: ApiKeyStatus,
+): void {
+  if (!canTransitionApiKeyStatus(from, to)) {
+    throw new ApiKeyStatusTransitionError(from, to);
+  }
 }
