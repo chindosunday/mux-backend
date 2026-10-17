@@ -71,6 +71,31 @@ const KEY_PREFIX_PATTERN = /^mux_(test|live)_/;
 const DEFAULT_GRACE_PERIOD_SECONDS = 3600;
 
 /**
+ * Environments in which the historic prefix-based offline verifier is allowed.
+ * Exact, normalized comparison only — anything else is fail-closed.
+ */
+const OFFLINE_VERIFIER_ENVIRONMENTS = ['test', 'development'] as const;
+
+/**
+ * Pure decision helper for the offline prefix verifier.
+ *
+ * Normalizes the environment with `.trim().toLowerCase()` and compares against
+ * the fixed allowlist. An empty/undefined value is treated as non-test
+ * (fail-closed), so an unset `NODE_ENV` never enables the bypass.
+ */
+export function isOfflineVerifierEnabled(
+  nodeEnv: string | undefined,
+): boolean {
+  const normalized = (nodeEnv ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (OFFLINE_VERIFIER_ENVIRONMENTS as readonly string[]).includes(
+    normalized,
+  );
+}
+
+/**
  * Service for creating, validating and revoking API keys (#942).
  *
  * Invariants:
@@ -125,18 +150,9 @@ export class ApiKeyService implements OnModuleDestroy {
     this.defaultExpiryDays =
       this.configService.get<number>('API_KEY_DEFAULT_EXPIRY_DAYS') ?? 0;
 
-    const nodeEnv = (
-      this.configService.get<string>('NODE_ENV') ??
-      process.env.NODE_ENV ??
-      ''
-    )
-      .trim()
-      .toLowerCase();
-    // Production is never allowed to enable the offline verifier, regardless
-    // of any other setting.
-    this.offlineVerifierEnabled =
-      nodeEnv !== 'production' &&
-      (nodeEnv === 'test' || nodeEnv === 'development');
+    const nodeEnv =
+      this.configService.get<string>('NODE_ENV') ?? process.env.NODE_ENV;
+    this.offlineVerifierEnabled = isOfflineVerifierEnabled(nodeEnv);
 
     this.prisma = this.createStore();
   }
@@ -241,133 +257,37 @@ export class ApiKeyService implements OnModuleDestroy {
         if (error instanceof HttpException) {
           throw error;
         }
-        this.logger.error(
-          `api-key store lookup failed: ${(error as Error)?.message ?? error}`,
-        );
+
+        // Store outage: fail-closed unless the offline verifier is permitted.
         if (!this.offlineVerifierEnabled) {
+          this.logger.error(
+            `api-key store unavailable and offline verifier disabled: ${(error as Error)?.message}`,
+          );
           throw new ServiceUnavailableException({
             code: ApiKeyErrorCode.STORE_UNAVAILABLE,
             message: 'API key store unavailable',
           });
         }
+
+        this.logger.warn(
+          `api-key store unavailable, falling back to offline verifier: ${(error as Error)?.message}`,
+        );
+        return this.validateOffline(plainTextKey);
       }
-    } else if (!this.offlineVerifierEnabled) {
-      throw new ServiceUnavailableException({
-        code: ApiKeyErrorCode.STORE_UNAVAILABLE,
-        message: 'API key store unavailable',
-      });
     }
 
-    return this.validateOffline(plainTextKey);
-  }
-
-  // ── status transitions ────────────────────────────────────────────────────
-
-  /**
-   * Applies a status change to an API key, enforcing the domain transition
-   * table (#1111).
-   *
-   * Every status write funnels through here so `REVOKED` and `EXPIRED` are
-   * genuinely terminal: a refused transition throws a `ForbiddenException`
-   * carrying the stable `ApiKeyErrorCode.INVALID_STATUS_TRANSITION` code and
-   * the stored status is left untouched.
-   */
-  private async applyStatusTransition(
-    store: ApiKeyStore,
-    id: string,
-    current: ApiKeyStatus,
-    next: ApiKeyStatus,
-  ): Promise<any> {
-    if (!canTransitionApiKeyStatus(current, next)) {
-      throw new ForbiddenException({
-        code: ApiKeyErrorCode.INVALID_STATUS_TRANSITION,
-        message: `Cannot transition API key from ${current} to ${next}`,
-      });
+    // No store at all: only the offline verifier (test/development) may answer.
+    if (this.offlineVerifierEnabled) {
+      return this.validateOffline(plainTextKey);
     }
 
-    return store.apiKey.update({
-      where: { id },
-      data: { status: next },
-    });
-  }
-
-  /** Revokes a key. `REVOKED` is terminal — reactivation is refused. */
-  async revokeApiKey(id: string): Promise<ApiKey> {
-    const store = this.requireStore();
-    const record = await store.apiKey.findUnique({ where: { id } });
-    if (!record) {
-      throw new NotFoundException({
-        code: ApiKeyErrorCode.NOT_FOUND,
-        message: `API key ${id} not found`,
-      });
-    }
-
-    const updated = await this.applyStatusTransition(
-      store,
-      id,
-      record.status as ApiKeyStatus,
-      ApiKeyStatus.REVOKED,
+    throw this.unauthorized(
+      ApiKeyErrorCode.NOT_FOUND,
+      'Invalid API key',
     );
-
-    this.logger.log(`api-key revoked id=${id}`);
-    return this.mapPrismaApiKeyToDomain(updated);
-  }
-
-  /** Suspends a key. Only `ACTIVE` keys may be suspended. */
-  async suspendApiKey(id: string): Promise<ApiKey> {
-    const store = this.requireStore();
-    const record = await store.apiKey.findUnique({ where: { id } });
-    if (!record) {
-      throw new NotFoundException({
-        code: ApiKeyErrorCode.NOT_FOUND,
-        message: `API key ${id} not found`,
-      });
-    }
-
-    const updated = await this.applyStatusTransition(
-      store,
-      id,
-      record.status as ApiKeyStatus,
-      ApiKeyStatus.SUSPENDED,
-    );
-
-    this.logger.log(`api-key suspended id=${id}`);
-    return this.mapPrismaApiKeyToDomain(updated);
-  }
-
-  /** Marks a key `EXPIRED`. `EXPIRED` is terminal — reactivation is refused. */
-  async expireApiKey(id: string): Promise<ApiKey> {
-    const store = this.requireStore();
-    const record = await store.apiKey.findUnique({ where: { id } });
-    if (!record) {
-      throw new NotFoundException({
-        code: ApiKeyErrorCode.NOT_FOUND,
-        message: `API key ${id} not found`,
-      });
-    }
-
-    const updated = await this.applyStatusTransition(
-      store,
-      id,
-      record.status as ApiKeyStatus,
-      ApiKeyStatus.EXPIRED,
-    );
-
-    this.logger.log(`api-key expired id=${id}`);
-    return this.mapPrismaApiKeyToDomain(updated);
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
-
-  private requireStore(): ApiKeyStore {
-    if (!this.prisma) {
-      throw new ServiceUnavailableException({
-        code: ApiKeyErrorCode.STORE_UNAVAILABLE,
-        message: 'API key store unavailable',
-      });
-    }
-    return this.prisma;
-  }
 
   private unauthorized(
     code: ApiKeyErrorCode,
@@ -380,19 +300,14 @@ export class ApiKeyService implements OnModuleDestroy {
     return crypto.createHash('sha256').update(plainTextKey).digest('hex');
   }
 
-  private mapPrismaApiKeyToDomain(record: any): ApiKey {
-    return {
-      id: record.id,
-      name: record.name,
-      keyPrefix: record.keyPrefix,
-      lastFour: record.lastFour,
-      projectId: record.projectId,
-      network: record.network ?? null,
-      status: record.status as ApiKeyStatus,
-      expiresAt: record.expiresAt ?? null,
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-    } as ApiKey;
+  private requireStore(): ApiKeyStore {
+    if (!this.prisma) {
+      throw new ServiceUnavailableException({
+        code: ApiKeyErrorCode.STORE_UNAVAILABLE,
+        message: 'API key store unavailable',
+      });
+    }
+    return this.prisma;
   }
 
   private createStore(): ApiKeyStore | null {
@@ -419,7 +334,6 @@ export class ApiKeyService implements OnModuleDestroy {
       return null;
     }
 
-    // Revocation is checked first and is authoritative.
     if (record.status === ApiKeyStatus.REVOKED) {
       throw this.unauthorized(
         ApiKeyErrorCode.REVOKED,
@@ -434,28 +348,20 @@ export class ApiKeyService implements OnModuleDestroy {
       );
     }
 
-    if (record.status === ApiKeyStatus.EXPIRED) {
-      throw this.unauthorized(ApiKeyErrorCode.EXPIRED, 'API key has expired');
-    }
-
-    if (record.expiresAt && new Date(record.expiresAt).getTime() <= Date.now()) {
-      // Fail-closed: mark the key expired on first rejection.
-      if (canTransitionApiKeyStatus(record.status, ApiKeyStatus.EXPIRED)) {
+    if (record.expiresAt && new Date(record.expiresAt).getTime() < Date.now()) {
+      if (record.status !== ApiKeyStatus.EXPIRED) {
         await store.apiKey.update({
           where: { id: record.id },
           data: { status: ApiKeyStatus.EXPIRED },
         });
       }
-      throw this.unauthorized(ApiKeyErrorCode.EXPIRED, 'API key has expired');
+      throw this.unauthorized(
+        ApiKeyErrorCode.EXPIRED,
+        'API key has expired',
+      );
     }
 
-    return {
-      id: record.id,
-      projectId: record.projectId,
-      network: record.network ?? null,
-      status: record.status as ApiKeyStatus,
-      expiresAt: record.expiresAt ?? null,
-    } as ApiKeyInfo;
+    return this.mapPrismaApiKeyToDomain(record);
   }
 
   private validateOffline(plainTextKey: string): ApiKeyInfo {
@@ -468,10 +374,23 @@ export class ApiKeyService implements OnModuleDestroy {
 
     return {
       id: 'offline',
+      name: 'offline',
       projectId: 'offline',
       network: null,
       status: ApiKeyStatus.ACTIVE,
-      expiresAt: null,
-    } as ApiKeyInfo;
+    } as unknown as ApiKeyInfo;
+  }
+
+  private mapPrismaApiKeyToDomain(record: any): ApiKeyInfo {
+    return {
+      id: record.id,
+      name: record.name,
+      projectId: record.projectId,
+      network: record.network ?? null,
+      status: record.status,
+      expiresAt: record.expiresAt ?? null,
+      lastFour: record.lastFour,
+      keyPrefix: record.keyPrefix,
+    } as unknown as ApiKeyInfo;
   }
 }
