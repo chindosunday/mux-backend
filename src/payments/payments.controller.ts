@@ -8,6 +8,7 @@ import {
   Delete,
   UseGuards,
   Req,
+  UnauthorizedException,
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { PaymentsService } from './payments.service';
@@ -31,8 +32,9 @@ import {
  *  - PATCH /payments/:id: ownership is re-verified before any mutation.
  *  - DELETE /payments/:id: ownership is re-verified before any mutation.
  *
- * The body's developerOwnerId field is intentionally overwritten here; it is
- * kept in the DTO only to support back-compat callers during the migration period.
+ * #1112 — The developer owner is resolved solely from the API key context. If
+ * it cannot be resolved, the request is rejected (fail closed) rather than
+ * falling back to any client-supplied value.
  */
 @Controller('payments')
 @UseGuards(ApiKeyGuard, RateLimitGuard)
@@ -47,9 +49,15 @@ export class PaymentsController {
     const developerOwnerId: string | undefined = (req as any).apiKeyContext
       ?.developer?.id;
 
+    if (!developerOwnerId) {
+      throw new UnauthorizedException(
+        'Unable to resolve developer from API key context',
+      );
+    }
+
     return this.paymentsService.create({
       ...createPaymentDto,
-      developerOwnerId: developerOwnerId ?? createPaymentDto.developerOwnerId,
+      developerOwnerId,
     });
   }
 

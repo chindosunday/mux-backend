@@ -54,6 +54,9 @@ const ALLOWED_TRANSITIONS: Record<string, PaymentStatus[]> = {
  *    wallet owned by another developer (e.g. marketplace payouts, refunds to a
  *    counterparty). Cross-developer receivers are therefore allowed by design;
  *    only the sender wallet is subject to the developerOwnerId isolation guard.
+ *
+ * #1112 – Ownership is resolved by the controller from the API key context and
+ * passed explicitly as `developerOwnerId`; it is never read from the request body.
  */
 @Injectable()
 export class PaymentsService {
@@ -87,7 +90,12 @@ export class PaymentsService {
     }
   }
 
-  async create(createPaymentDto: CreatePaymentDto) {
+  /**
+   * #1112 – `developerOwnerId` is supplied by the controller from the API key
+   * context, never from the request body. It is required so ownership can never
+   * be claimed by a caller.
+   */
+  async create(createPaymentDto: CreatePaymentDto, developerOwnerId: string) {
     const {
       walletId,
       receiverWalletId,
@@ -96,7 +104,6 @@ export class PaymentsService {
       amount,
       currency,
       description,
-      developerOwnerId,
       idempotencyKey,
     } = createPaymentDto;
 
@@ -206,95 +213,6 @@ export class PaymentsService {
   }
 
   /**
-   * Returns a single payment, asserting ownership when isolation is enabled.
-   * Returns 404 even if the payment exists but belongs to a different developer
-   * so as not to leak that the record exists.
-   */
-  async findOne(id: string, developerOwnerId?: string) {
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: Number(id) },
-    });
+   * 
 
-    if (!payment) {
-      throw new NotFoundException(`Payment #${id} not found`);
-    }
-
-    if (
-      this.isolationEnabled &&
-      developerOwnerId &&
-      payment.developerOwnerId &&
-      payment.developerOwnerId !== developerOwnerId
-    ) {
-      // Intentional 404 — do not reveal cross-developer record existence.
-      throw new NotFoundException(`Payment #${id} not found`);
-    }
-
-    return payment;
-  }
-
-  async update(id: number, updatePaymentDto: UpdatePaymentDto, developerOwnerId?: string) {
-    const payment = await this.prisma.payment.findUnique({ where: { id } });
-    if (!payment) {
-      throw new NotFoundException(`Payment #${id} not found`);
-    }
-
-    // Authz: developer may only mutate their own payments.
-    if (
-      this.isolationEnabled &&
-      developerOwnerId &&
-      payment.developerOwnerId &&
-      payment.developerOwnerId !== developerOwnerId
-    ) {
-      this.logger.warn(
-        `Forbidden update attempt on payment ${id} by developer ${developerOwnerId}`,
-      );
-      throw new ForbiddenException(
-        'You do not have permission to update this payment',
-      );
-    }
-
-    // State machine: validate the transition after the ownership re-check so
-    // cross-developer updates still surface the non-enumerating 404/403 above.
-    if (updatePaymentDto.status !== undefined) {
-      this.assertTransitionAllowed(
-        payment.status as PaymentStatus,
-        updatePaymentDto.status,
-      );
-    }
-
-    return this.prisma.payment.update({
-      where: { id },
-      data: updatePaymentDto,
-    });
-  }
-
-  /**
-   * Deletes a payment, asserting ownership when isolation is enabled.
-   * A non-owned id yields 404 (matching findOne) and performs no mutation,
-   * so a developer cannot delete another developer's payment by guessing ids.
-   */
-  async remove(id: string, developerOwnerId?: string) {
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: Number(id) },
-    });
-
-    if (!payment) {
-      throw new NotFoundException(`Payment #${id} not found`);
-    }
-
-    if (
-      this.isolationEnabled &&
-      developerOwnerId &&
-      payment.developerOwnerId &&
-      payment.developerOwnerId !== developerOwnerId
-    ) {
-      // Intentional 404 — do not reveal cross-developer record existence.
-      this.logger.warn(
-        `Cross-developer delete attempt on payment ${id} by developer ${developerOwnerId}`,
-      );
-      throw new NotFoundException(`Payment #${id} not found`);
-    }
-
-    return this.prisma.payment.delete({ where: { id: Number(id) } });
-  }
-}
+/* … truncated 2924 chars — edit only what you need near the top … */
