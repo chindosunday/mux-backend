@@ -1395,3 +1395,6 @@ Query parameters: `userId`, `network`, `status`, `includeArchived` (default `fal
 - #1067: Add unit tests for rate-limit and developer-quota guard fail-closed behaviour
 <!-- handsoff-issue-1066 -->
 - #1066: Cover soroban-invoke service error paths in unit tests
+
+<!-- handsoff-issue-1121 -->
+- #1121: Soroban invoke: enforce MAX_INVOKE_ARGS / MAX_INVOKE_ARG_BYTES bounds with unit tests

@@ -1,4 +1,3 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsOptional,
@@ -9,23 +8,19 @@ import {
   ValidateIf,
 } from 'class-validator';
 
-/**
- * Allowed nickname charset: letters, digits, spaces and a small set of
- * punctuation. Deliberately excludes control characters, angle brackets and
- * other characters that could be abused for log/HTML injection.
- */
-export const WALLET_NICKNAME_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} ._'-]*$/u;
-
-export const WALLET_NICKNAME_MIN_LENGTH = 1;
-export const WALLET_NICKNAME_MAX_LENGTH = 100;
+export const WALLET_NICKNAME_PATTERN = /^[\p{L}\p{N} .,'&()_-]+$/u;
 
 /**
- * Normalizes a nickname before validation/persistence:
- * - trims leading/trailing whitespace
- * - collapses internal whitespace runs to a single space
- * - applies Unicode NFC so visually identical labels compare equal
+ * Normalizes a nickname before validation/persistence.
  *
- * `null`/`undefined` are preserved so the "clear nickname" path still works.
+ * - Trims surrounding whitespace and collapses internal whitespace runs to a
+ *   single space.
+ * - Applies Unicode NFC normalization so visually identical nicknames compare
+ *   equal.
+ * - `null`/`undefined` are preserved so the "clear nickname" path still works.
+ * - Non-string input is treated as absent and returned as `undefined` so the
+ *   field is rejected deterministically by `@IsString()` (or skipped when the
+ *   field is optional) instead of being passed through as a lying cast.
  */
 export function normalizeWalletNickname(
   value: unknown,
@@ -33,33 +28,21 @@ export function normalizeWalletNickname(
   if (value === null || value === undefined) {
     return value;
   }
+
   if (typeof value !== 'string') {
-    return value as unknown as string;
+    return undefined;
   }
-  return value.normalize('NFC').replace(/\s+/g, ' ').trim();
+
+  return value.trim().replace(/\s+/g, ' ').normalize('NFC');
 }
 
 export class UpdateWalletNicknameDto {
-  /**
-   * Human-readable label for the wallet (e.g. "Savings", "Hot wallet").
-   * Pass `null` to clear an existing nickname.
-   */
-  @ApiPropertyOptional({
-    example: 'Savings wallet',
-    description:
-      'Human-readable label for the wallet. Pass null to clear the nickname.',
-    minLength: WALLET_NICKNAME_MIN_LENGTH,
-    maxLength: WALLET_NICKNAME_MAX_LENGTH,
-    nullable: true,
-  })
-  @IsOptional()
   @Transform(({ value }) => normalizeWalletNickname(value))
   @ValidateIf((_, value) => value !== null)
+  @IsOptional()
   @IsString()
-  @MinLength(WALLET_NICKNAME_MIN_LENGTH)
-  @MaxLength(WALLET_NICKNAME_MAX_LENGTH)
-  @Matches(WALLET_NICKNAME_PATTERN, {
-    message: "nickname may only contain letters, numbers, spaces and . _ ' -",
-  })
+  @MinLength(1)
+  @MaxLength(100)
+  @Matches(WALLET_NICKNAME_PATTERN)
   nickname?: string | null;
 }

@@ -1,80 +1,174 @@
-import { UnauthorizedException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiKeyService } from './api-key.service';
-import { ApiKeyStore } from './domain/api-key.model';
+import { ApiKeyStatus } from './domain/api-key.model';
+import { NetworkErrorCode } from '../common/network/network-mismatch';
 
-function createStoreStub(): jest.Mocked<ApiKeyStore> {
-  return {
-    findByHash: jest.fn().mockResolvedValue(null),
-    findByPrefix: jest.fn().mockResolvedValue([]),
-    create: jest.fn(),
-    revoke: jest.fn(),
-    list: jest.fn(),
-    touchLastUsed: jest.fn(),
-  } as unknown as jest.Mocked<ApiKeyStore>;
+/**
+ * Minimal structural stub of the `ApiKeyStore` interface declared in
+ * `api-key.service.ts`. The interface is structural precisely so the service
+ * can be exercised without Prisma.
+ */
+class StubApiKeyStore {
+  findUnique = jest.fn();
+  update = jest.fn();
 }
 
-function createConfigService(nodeEnv: string | undefined): ConfigService {
+function makeConfig(): ConfigService {
+  const values: Record<string, string> = {
+    API_KEY_HASH_SECRET: 'test-secret',
+  };
   return {
-    get: jest.fn((key: string) => (key === 'NODE_ENV' ? nodeEnv : undefined)),
+    get: (key: string) => values[key],
   } as unknown as ConfigService;
 }
 
-describe('ApiKeyService offline verifier gating', () => {
-  const originalNodeEnv = process.env.NODE_ENV;
+function makeRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'key-1',
+    hashedKey: 'hashed',
+    status: ApiKeyStatus.ACTIVE,
+    network: null,
+    expiresAt: null,
+    ...overrides,
+  };
+}
 
-  afterEach(() => {
-    if (originalNodeEnv === undefined) {
-      delete process.env.NODE_ENV;
-    } else {
-      process.env.NODE_ENV = originalNodeEnv;
+function buildService(store: StubApiKeyStore): ApiKeyService {
+  return new ApiKeyService(store as never, makeConfig());
+}
+
+describe('ApiKeyService', () => {
+  let store: StubApiKeyStore;
+  let service: ApiKeyService;
+
+  beforeEach(() => {
+    store = new StubApiKeyStore();
+    service = buildService(store);
+  });
+
+  it('rejects a REVOKED key without mutating the store', async () => {
+    store.findUnique.mockResolvedValue(
+      makeRow({ status: ApiKeyStatus.REVOKED }),
+    );
+
+    await expect(service.validateApiKey('raw-key')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    await expect(service.validateApiKey('raw-key')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'API_KEY_REVOKED' }),
+    });
+    expect(store.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects an expired key and marks it EXPIRED exactly once', async () => {
+    store.findUnique.mockResolvedValue(
+      makeRow({ expiresAt: new Date(Date.now() - 60_000) }),
+    );
+    store.update.mockResolvedValue(
+      makeRow({ status: ApiKeyStatus.EXPIRED }),
+    );
+
+    await expect(service.validateApiKey('raw-key')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(store.update).toHaveBeenCalledTimes(1);
+    expect(store.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: ApiKeyStatus.EXPIRED }),
+      }),
+    );
+  });
+
+  it('rejects a TESTNET-scoped key used on MAINNET with NETWORK_MISMATCH', async () => {
+    store.findUnique.mockResolvedValue(
+      makeRow({ network: 'TESTNET' }),
+    );
+
+    await expect(
+      service.validateApiKey('raw-key', 'MAINNET'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        code: NetworkErrorCode.NETWORK_MISMATCH,
+      }),
+    });
+    await expect(
+      service.validateApiKey('raw-key', 'MAINNET'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('fails closed with 503 when the store read throws', async () => {
+    store.findUnique.mockRejectedValue(new Error('db down'));
+
+    await expect(service.validateApiKey('raw-key')).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+  });
+
+  describe('offline verifier gating', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      if (originalNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    function buildGatedService(nodeEnv: string | undefined): {
+      service: ApiKeyService;
+      store: StubApiKeyStore;
+    } {
+      if (nodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = nodeEnv;
+      }
+      const gatedStore = new StubApiKeyStore();
+      gatedStore.findUnique.mockResolvedValue(null);
+      const gatedService = new ApiKeyService(
+        gatedStore as never,
+        makeConfig(),
+      );
+      return { service: gatedService, store: gatedStore };
     }
-  });
 
-  function buildService(nodeEnv: string | undefined): {
-    service: ApiKeyService;
-    store: jest.Mocked<ApiKeyStore>;
-  } {
-    if (nodeEnv === undefined) {
-      delete process.env.NODE_ENV;
-    } else {
-      process.env.NODE_ENV = nodeEnv;
-    }
-    const store = createStoreStub();
-    const service = new ApiKeyService(store, createConfigService(nodeEnv));
-    return { service, store };
-  }
+    it('rejects an unknown key under NODE_ENV=production', async () => {
+      const { service: gated } = buildGatedService('production');
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
 
-  it('rejects an unknown key under NODE_ENV=production', async () => {
-    const { service } = buildService('production');
-    await expect(service.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
-  });
+    it('rejects an unknown key under NODE_ENV=staging', async () => {
+      const { service: gated } = buildGatedService('staging');
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
 
-  it('rejects an unknown key under NODE_ENV=staging', async () => {
-    const { service } = buildService('staging');
-    await expect(service.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
-  });
+    it('rejects an unknown key when NODE_ENV is unset', async () => {
+      const { service: gated } = buildGatedService(undefined);
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
 
-  it('rejects an unknown key when NODE_ENV is unset', async () => {
-    const { service } = buildService(undefined);
-    await expect(service.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
-  });
+    it('allows a mux_test_ prefixed key under NODE_ENV=test', async () => {
+      const { service: gated } = buildGatedService('test');
+      const context = await gated.validateApiKey('mux_test_offline');
+      expect(context).toBeDefined();
+    });
 
-  it('allows a mux_test_ prefixed key under NODE_ENV=test', async () => {
-    const { service } = buildService('test');
-    const context = await service.validateApiKey('mux_test_offline');
-    expect(context).toBeDefined();
-  });
-
-  it('treats whitespace/case NODE_ENV=" TEST " as test', async () => {
-    const { service } = buildService(' TEST ');
-    const context = await service.validateApiKey('mux_test_offline');
-    expect(context).toBeDefined();
+    it('treats whitespace/case NODE_ENV=" TEST " as test', async () => {
+      const { service: gated } = buildGatedService(' TEST ');
+      const context = await gated.validateApiKey('mux_test_offline');
+      expect(context).toBeDefined();
+    });
   });
 });
